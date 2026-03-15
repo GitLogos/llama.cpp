@@ -12,22 +12,25 @@ jobs:
 
     env:
       BUILD_TYPE: Release
-      # OpenVINO archive (Windows) - see OpenVINO docs for archive install URLs.
-      # You can update OV_URL/OV_VERSION when bumping OpenVINO.
+
+      # OpenVINO archive (Windows). Update when bumping OpenVINO.
       OV_VERSION: "2026.0.0.20965.c6d6a13a886"
       OV_URL: "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.0/windows/openvino_toolkit_windows_2026.0.0.20965.c6d6a13a886_x86_64.zip"
+
+      # vcpkg location
+      VCPKG_ROOT: "C:\\vcpkg"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Sets up MSVC developer environment (cl, link, etc.)
+      # MSVC dev environment (cl/link) - needed for Ninja+MSVC
       - name: Setup MSVC Dev Cmd
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # Cache extracted OpenVINO to speed up subsequent runs
+      # Cache OpenVINO extracted directory
       - name: Cache OpenVINO
         uses: actions/cache@v4
         with:
@@ -47,12 +50,38 @@ jobs:
             Move-Item $dir.FullName "C:\openvino"
           }
 
-      # Configure+build per llama.cpp OpenVINO doc: -G Ninja, -DGGML_OPENVINO=ON, and commonly disable curl for simpler Windows builds
+      # Cache vcpkg (repo + installed packages)
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\vcpkg
+          key: vcpkg-windows-x64-opencl
+
+      - name: Install OpenCL via vcpkg (required by OpenVINO backend)
+        shell: pwsh
+        run: |
+          if (!(Test-Path "${env:VCPKG_ROOT}\vcpkg.exe")) {
+            git clone https://github.com/microsoft/vcpkg "${env:VCPKG_ROOT}"
+            & "${env:VCPKG_ROOT}\bootstrap-vcpkg.bat"
+          }
+          # Install OpenCL headers+library for x64
+          & "${env:VCPKG_ROOT}\vcpkg.exe" install opencl:x64-windows
+          # Optional: integrates toolchain with VS/CMake, not required for CI
+          # & "${env:VCPKG_ROOT}\vcpkg.exe" integrate install
+
       - name: Configure + Build llama-server (OpenVINO)
         shell: cmd
         run: |
           call C:\openvino\setupvars.bat
-          cmake -S . -B build\ReleaseOV -G Ninja -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DGGML_OPENVINO=ON -DLLAMA_CURL=OFF
+
+          cmake -S . -B build\ReleaseOV -G Ninja ^
+            -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
+            -DGGML_OPENVINO=ON ^
+            -DLLAMA_CURL=OFF ^
+            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
+            -DVCPKG_TARGET_TRIPLET=x64-windows
+
           cmake --build build\ReleaseOV --config %BUILD_TYPE% --parallel
 
       - name: Stage llama-server.exe
@@ -60,69 +89,29 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 
-          $candidates = @(
-            "build\ReleaseOV\bin\llama-server.exe",
-            "build\ReleaseOV\bin\Release\llama-server.exe",
-            "build\ReleaseOV\llama-server.exe",
-            "build\ReleaseOV\Release\llama-server.exe"
-          )
-
-          $server = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $server) {
-            # Fallback: search in build tree
-            $server = Get-ChildItem -Path "build\ReleaseOV" -Recurse -Filter "llama-server.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
+          $server = Get-ChildItem -Path "build\ReleaseOV" -Recurse -Filter "llama-server.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $server) { throw "llama-server.exe not found after build." }
 
           Copy-Item $server.FullName "dist\llama-server.exe" -Force
 
-      # Bundle OpenVINO runtime next to the EXE so it runs without requiring a separate OpenVINO install.
-      # This intentionally "over-copies" (safe for a first upstreamable CI artifact).
-      - name: Bundle OpenVINO runtime (CPU-oriented, self-contained)
+      # Optional: bundle OpenVINO runtime DLLs next to the EXE so it runs without OpenVINO installed
+      # (You requested this approach earlier; keep it here since it aligns with "no extra requirements".)
+      - name: Bundle OpenVINO runtime DLLs (self-contained)
         shell: pwsh
         run: |
           $ovRoot = "C:\openvino"
-          if (!(Test-Path $ovRoot)) { throw "OpenVINO root not found: $ovRoot" }
-
-          # Find the primary runtime bin folder by locating openvino.dll
           $openvinoDll = Get-ChildItem -Path $ovRoot -Recurse -Filter "openvino.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $openvinoDll) { throw "Could not locate openvino.dll under $ovRoot" }
 
           $ovBin = $openvinoDll.Directory.FullName
           Write-Host "Detected OpenVINO runtime bin: $ovBin"
 
-          # Copy all DLLs from that bin directory (includes CPU plugin & dependencies in typical layouts)
-          Get-ChildItem -Path $ovBin -Filter "*.dll" -File | ForEach-Object {
-            Copy-Item $_.FullName "dist\" -Force
-          }
+          Copy-Item "$ovBin\*.dll" "dist\" -Force -ErrorAction SilentlyContinue
+          Copy-Item "$ovBin\*.xml" "dist\" -Force -ErrorAction SilentlyContinue
 
-          # Copy plugins.xml / configs if present (OpenVINO plugin discovery commonly uses this)
-          Get-ChildItem -Path $ovBin -Filter "*.xml" -File -ErrorAction SilentlyContinue | ForEach-Object {
-            Copy-Item $_.FullName "dist\" -Force
-          }
-
-          # Also copy TBB DLLs if present in the distribution (common dependency)
-          $tbbDlls = Get-ChildItem -Path $ovRoot -Recurse -Filter "tbb*.dll" -ErrorAction SilentlyContinue
-          foreach ($dll in $tbbDlls) {
-            Copy-Item $dll.FullName "dist\" -Force
-          }
-
-          # Include licensing files (best-effort) for redistribution compliance
-          New-Item -ItemType Directory -Force -Path "dist\THIRD_PARTY\openvino" | Out-Null
-          $licenseCandidates = @(
-            Join-Path $ovRoot "LICENSE",
-            Join-Path $ovRoot "LICENSE.txt",
-            Join-Path $ovRoot "licensing\LICENSE",
-            Join-Path $ovRoot "licensing\LICENSE.txt",
-            Join-Path $ovRoot "runtime\LICENSE",
-            Join-Path $ovRoot "runtime\LICENSE.txt"
-          )
-
-          foreach ($p in $licenseCandidates) {
-            if (Test-Path $p) {
-              Copy-Item $p "dist\THIRD_PARTY\openvino\" -Force
-            }
-          }
+          # Copy TBB DLLs if present
+          Get-ChildItem -Path $ovRoot -Recurse -Filter "tbb*.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName "dist\" -Force }
 
       - name: Smoke test (help)
         shell: pwsh
