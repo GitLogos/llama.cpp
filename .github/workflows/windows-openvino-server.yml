@@ -13,24 +13,27 @@ jobs:
     env:
       BUILD_TYPE: Release
 
-      # OpenVINO archive (Windows). Update when bumping OpenVINO.
+      # OpenVINO archive (Windows) - installed by downloading/extracting the official zip. [1](https://github.com/ggml-org/llama.cpp/releases)
       OV_VERSION: "2026.0.0.20965.c6d6a13a886"
       OV_URL: "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.0/windows/openvino_toolkit_windows_2026.0.0.20965.c6d6a13a886_x86_64.zip"
 
       # vcpkg location
       VCPKG_ROOT: "C:\\vcpkg"
 
+      # vcpkg triplet
+      VCPKG_TRIPLET: "x64-windows"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # MSVC dev environment (cl/link) - needed for Ninja+MSVC
+      # MSVC dev environment (cl/link) for Ninja+MSVC builds on Windows. 
       - name: Setup MSVC Dev Cmd
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # Cache OpenVINO extracted directory
+      # Cache extracted OpenVINO to speed up subsequent runs. [1](https://github.com/ggml-org/llama.cpp/releases)
       - name: Cache OpenVINO
         uses: actions/cache@v4
         with:
@@ -50,26 +53,57 @@ jobs:
             Move-Item $dir.FullName "C:\openvino"
           }
 
-      # Cache vcpkg (repo + installed packages)
-      - name: Cache vcpkg
+      # Cache vcpkg repo + downloads to speed up subsequent runs.
+      - name: Cache vcpkg (repo + downloads)
         uses: actions/cache@v4
         with:
           path: |
             C:\vcpkg
-          key: vcpkg-windows-x64-opencl
+          key: vcpkg-repo-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}
 
-      - name: Install OpenCL via vcpkg (required by OpenVINO backend)
+      # Cache manifest-installed packages (vcpkg_installed) inside the repo workspace.
+      - name: Cache vcpkg_installed (manifest mode)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}\vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-opencl
+
+      - name: Bootstrap vcpkg (if needed)
         shell: pwsh
         run: |
           if (!(Test-Path "${env:VCPKG_ROOT}\vcpkg.exe")) {
             git clone https://github.com/microsoft/vcpkg "${env:VCPKG_ROOT}"
             & "${env:VCPKG_ROOT}\bootstrap-vcpkg.bat"
           }
-          # Install OpenCL headers+library for x64
-          & "${env:VCPKG_ROOT}\vcpkg.exe" install opencl:x64-windows
-          # Optional: integrates toolchain with VS/CMake, not required for CI
-          # & "${env:VCPKG_ROOT}\vcpkg.exe" integrate install
 
+      # Create a minimal manifest so vcpkg "manifest mode" can install OpenCL dependency. 
+      - name: Create vcpkg manifest (OpenCL)
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          @'
+          {
+            "name": "llama-openvino-ci",
+            "version-string": "0.0.1",
+            "dependencies": [
+              "opencl"
+            ]
+          }
+          '@ | Out-File -FilePath "vcpkg.json" -Encoding utf8
+
+      # Install OpenCL via vcpkg (required for the OpenVINO backend CMake config on Windows). 
+      - name: Install OpenCL via vcpkg (manifest mode)
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          & "${env:VCPKG_ROOT}\vcpkg.exe" install --triplet $env:VCPKG_TRIPLET
+
+      # Configure+build per llama.cpp OpenVINO Windows instructions:
+      # - run setupvars.bat
+      # - CMake + Ninja
+      # - -DGGML_OPENVINO=ON
+      # - install OpenCL via vcpkg + use vcpkg toolchain file 
       - name: Configure + Build llama-server (OpenVINO)
         shell: cmd
         run: |
@@ -80,7 +114,7 @@ jobs:
             -DGGML_OPENVINO=ON ^
             -DLLAMA_CURL=OFF ^
             -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DVCPKG_TARGET_TRIPLET=x64-windows
+            -DVCPKG_TARGET_TRIPLET=%VCPKG_TRIPLET%
 
           cmake --build build\ReleaseOV --config %BUILD_TYPE% --parallel
 
@@ -94,12 +128,14 @@ jobs:
 
           Copy-Item $server.FullName "dist\llama-server.exe" -Force
 
-      # Optional: bundle OpenVINO runtime DLLs next to the EXE so it runs without OpenVINO installed
-      # (You requested this approach earlier; keep it here since it aligns with "no extra requirements".)
+      # Bundle OpenVINO runtime DLLs next to the EXE so the artifact doesn't assume OpenVINO is installed. [1](https://github.com/ggml-org/llama.cpp/releases)
       - name: Bundle OpenVINO runtime DLLs (self-contained)
         shell: pwsh
         run: |
           $ovRoot = "C:\openvino"
+          if (!(Test-Path $ovRoot)) { throw "OpenVINO root not found: $ovRoot" }
+
+          # Find openvino.dll and copy everything from that bin folder.
           $openvinoDll = Get-ChildItem -Path $ovRoot -Recurse -Filter "openvino.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $openvinoDll) { throw "Could not locate openvino.dll under $ovRoot" }
 
@@ -109,9 +145,9 @@ jobs:
           Copy-Item "$ovBin\*.dll" "dist\" -Force -ErrorAction SilentlyContinue
           Copy-Item "$ovBin\*.xml" "dist\" -Force -ErrorAction SilentlyContinue
 
-          # Copy TBB DLLs if present
+          # Copy TBB DLLs if present in the OpenVINO distribution (common dependency).
           Get-ChildItem -Path $ovRoot -Recurse -Filter "tbb*.dll" -ErrorAction SilentlyContinue |
-            ForEach-Object { Copy-Item $_.FullName "dist\" -Force }
+            ForEach-Object { Copy-Item $_.FullName "dist\" -Force -ErrorAction SilentlyContinue }
 
       - name: Smoke test (help)
         shell: pwsh
