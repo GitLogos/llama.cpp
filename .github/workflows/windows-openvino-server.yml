@@ -174,10 +174,11 @@ jobs:
           Get-ChildItem C:\openvino -Recurse -Filter "tbb*.dll" -ErrorAction SilentlyContinue |
             ForEach-Object { Copy-Item $_.FullName dist\ -Force -ErrorAction SilentlyContinue }
 
-      - name: Smoke test (help)
-        shell: pwsh
+      - name: Smoke test (help) with OpenVINO env
+        shell: cmd
         run: |
-          .\dist\llama-server.exe --help | Out-Null
+          call C:\openvino\setupvars.bat
+          "%GITHUB_WORKSPACE%\dist\llama-server.exe" --help
 
       - name: Package artifact
         shell: pwsh
