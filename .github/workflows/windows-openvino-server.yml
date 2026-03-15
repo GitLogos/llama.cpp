@@ -1,0 +1,141 @@
+name: windows-openvino-llama-server
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "master" ]
+  pull_request:
+
+jobs:
+  build-windows-openvino-server:
+    runs-on: windows-2022
+
+    env:
+      BUILD_TYPE: Release
+      # OpenVINO archive (Windows) - see OpenVINO docs for archive install URLs.
+      # You can update OV_URL/OV_VERSION when bumping OpenVINO.
+      OV_VERSION: "2026.0.0.20965.c6d6a13a886"
+      OV_URL: "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.0/windows/openvino_toolkit_windows_2026.0.0.20965.c6d6a13a886_x86_64.zip"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Sets up MSVC developer environment (cl, link, etc.)
+      - name: Setup MSVC Dev Cmd
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Cache extracted OpenVINO to speed up subsequent runs
+      - name: Cache OpenVINO
+        uses: actions/cache@v4
+        with:
+          path: C:\openvino
+          key: openvino-${{ env.OV_VERSION }}-windows-x64
+
+      - name: Download + Extract OpenVINO (if not cached)
+        shell: pwsh
+        run: |
+          if (!(Test-Path "C:\openvino")) {
+            New-Item -ItemType Directory -Force -Path "C:\ovtmp" | Out-Null
+            Write-Host "Downloading OpenVINO: $env:OV_URL"
+            curl.exe -L "$env:OV_URL" --output "C:\ovtmp\openvino.zip"
+            Expand-Archive -Path "C:\ovtmp\openvino.zip" -DestinationPath "C:\ovtmp\extract"
+            $dir = Get-ChildItem "C:\ovtmp\extract" | Where-Object { $_.PSIsContainer } | Select-Object -First 1
+            if (-not $dir) { throw "OpenVINO archive extraction failed (no directory found)." }
+            Move-Item $dir.FullName "C:\openvino"
+          }
+
+      # Configure+build per llama.cpp OpenVINO doc: -G Ninja, -DGGML_OPENVINO=ON, and commonly disable curl for simpler Windows builds
+      - name: Configure + Build llama-server (OpenVINO)
+        shell: cmd
+        run: |
+          call C:\openvino\setupvars.bat
+          cmake -S . -B build\ReleaseOV -G Ninja -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DGGML_OPENVINO=ON -DLLAMA_CURL=OFF
+          cmake --build build\ReleaseOV --config %BUILD_TYPE% --parallel
+
+      - name: Stage llama-server.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+
+          $candidates = @(
+            "build\ReleaseOV\bin\llama-server.exe",
+            "build\ReleaseOV\bin\Release\llama-server.exe",
+            "build\ReleaseOV\llama-server.exe",
+            "build\ReleaseOV\Release\llama-server.exe"
+          )
+
+          $server = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $server) {
+            # Fallback: search in build tree
+            $server = Get-ChildItem -Path "build\ReleaseOV" -Recurse -Filter "llama-server.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $server) { throw "llama-server.exe not found after build." }
+
+          Copy-Item $server.FullName "dist\llama-server.exe" -Force
+
+      # Bundle OpenVINO runtime next to the EXE so it runs without requiring a separate OpenVINO install.
+      # This intentionally "over-copies" (safe for a first upstreamable CI artifact).
+      - name: Bundle OpenVINO runtime (CPU-oriented, self-contained)
+        shell: pwsh
+        run: |
+          $ovRoot = "C:\openvino"
+          if (!(Test-Path $ovRoot)) { throw "OpenVINO root not found: $ovRoot" }
+
+          # Find the primary runtime bin folder by locating openvino.dll
+          $openvinoDll = Get-ChildItem -Path $ovRoot -Recurse -Filter "openvino.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $openvinoDll) { throw "Could not locate openvino.dll under $ovRoot" }
+
+          $ovBin = $openvinoDll.Directory.FullName
+          Write-Host "Detected OpenVINO runtime bin: $ovBin"
+
+          # Copy all DLLs from that bin directory (includes CPU plugin & dependencies in typical layouts)
+          Get-ChildItem -Path $ovBin -Filter "*.dll" -File | ForEach-Object {
+            Copy-Item $_.FullName "dist\" -Force
+          }
+
+          # Copy plugins.xml / configs if present (OpenVINO plugin discovery commonly uses this)
+          Get-ChildItem -Path $ovBin -Filter "*.xml" -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName "dist\" -Force
+          }
+
+          # Also copy TBB DLLs if present in the distribution (common dependency)
+          $tbbDlls = Get-ChildItem -Path $ovRoot -Recurse -Filter "tbb*.dll" -ErrorAction SilentlyContinue
+          foreach ($dll in $tbbDlls) {
+            Copy-Item $dll.FullName "dist\" -Force
+          }
+
+          # Include licensing files (best-effort) for redistribution compliance
+          New-Item -ItemType Directory -Force -Path "dist\THIRD_PARTY\openvino" | Out-Null
+          $licenseCandidates = @(
+            Join-Path $ovRoot "LICENSE",
+            Join-Path $ovRoot "LICENSE.txt",
+            Join-Path $ovRoot "licensing\LICENSE",
+            Join-Path $ovRoot "licensing\LICENSE.txt",
+            Join-Path $ovRoot "runtime\LICENSE",
+            Join-Path $ovRoot "runtime\LICENSE.txt"
+          )
+
+          foreach ($p in $licenseCandidates) {
+            if (Test-Path $p) {
+              Copy-Item $p "dist\THIRD_PARTY\openvino\" -Force
+            }
+          }
+
+      - name: Smoke test (help)
+        shell: pwsh
+        run: |
+          & ".\dist\llama-server.exe" --help | Out-Null
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\*" -DestinationPath "llama-server-win-openvino-x64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-server-win-openvino-x64
+          path: llama-server-win-openvino-x64.zip
