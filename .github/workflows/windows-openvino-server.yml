@@ -13,32 +13,43 @@ jobs:
     env:
       BUILD_TYPE: Release
 
-      # OpenVINO archive install (Windows) - download/extract in CI. [5](https://zhuanlan.zhihu.com/p/718654291)
+      # OpenVINO archive (Windows) - download/extract automation is supported by OpenVINO docs. [6](https://zhuanlan.zhihu.com/p/718654291)
       OV_VERSION: "2026.0.0.20965.c6d6a13a886"
       OV_URL: "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.0/windows/openvino_toolkit_windows_2026.0.0.20965.c6d6a13a886_x86_64.zip"
 
-      # Local vcpkg clone (shallow)
+      # Our vcpkg clone location (we force this after MSVC env is set). [4](https://github.com/dougeeai/llama-cpp-python-wheels/releases)[5](https://serapieum-of-alex.github.io/llama-utils/main/tools/llama-cpp.html)
       VCPKG_ROOT: "C:\\vcpkg"
       VCPKG_TRIPLET: "x64-windows"
 
     steps:
-      # ------------------------------------------------------------
-      # Source
-      # ------------------------------------------------------------
       - name: Checkout llama.cpp
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # Toolchain
-      # ------------------------------------------------------------
+      # MSVC environment (cl/link). Note this can overwrite VCPKG_ROOT to VS-bundled vcpkg; we correct it after. [4](https://github.com/dougeeai/llama-cpp-python-wheels/releases)[5](https://serapieum-of-alex.github.io/llama-utils/main/tools/llama-cpp.html)
       - name: Setup MSVC (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ------------------------------------------------------------
-      # OpenVINO runtime (archive install)
-      # ------------------------------------------------------------
+      # Re-force our intended VCPKG_ROOT for all subsequent steps (workaround for VS overwriting VCPKG_ROOT). [4](https://github.com/dougeeai/llama-cpp-python-wheels/releases)[5](https://serapieum-of-alex.github.io/llama-utils/main/tools/llama-cpp.html)
+      - name: Force VCPKG_ROOT back to C:\vcpkg
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=C:\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Ninja is required for the -G Ninja generator used in the OpenVINO backend instructions. [3](https://docs.openvino.ai/2025/openvino-workflow/deployment-locally.html)
+      - name: Ensure Ninja is installed
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            winget install --id Ninja-build.Ninja -e --source winget --accept-source-agreements --accept-package-agreements
+          }
+          ninja --version
+
+      # -------------------------
+      # OpenVINO runtime (archive)
+      # -------------------------
       - name: Cache OpenVINO
         uses: actions/cache@v4
         with:
@@ -50,7 +61,6 @@ jobs:
         run: |
           if (!(Test-Path "C:\openvino")) {
             New-Item -ItemType Directory -Force -Path "C:\ovtmp" | Out-Null
-            Write-Host "Downloading OpenVINO..."
             curl.exe -L "$env:OV_URL" --output "C:\ovtmp\openvino.zip"
             Expand-Archive -Path "C:\ovtmp\openvino.zip" -DestinationPath "C:\ovtmp\extract"
             $dir = Get-ChildItem "C:\ovtmp\extract" | Where-Object { $_.PSIsContainer } | Select-Object -First 1
@@ -58,9 +68,9 @@ jobs:
             Move-Item $dir.FullName "C:\openvino"
           }
 
-      # ------------------------------------------------------------
-      # vcpkg (SHALLOW CLONE + robust repo detection)
-      # ------------------------------------------------------------
+      # -------------------------
+      # vcpkg (shallow clone)
+      # -------------------------
       - name: Cache vcpkg repo
         uses: actions/cache@v4
         with:
@@ -71,42 +81,33 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}\vcpkg_installed
-          key: vcpkg-installed-windows-${{ env.VCPKG_TRIPLET }}
+          key: vcpkg-installed-windows-${{ env.VCPKG_TRIPLET }}-opencl
 
       - name: Ensure vcpkg is a real git repo (shallow clone if needed)
         shell: pwsh
         run: |
-          $root = "${env:VCPKG_ROOT}"
+          $root = "$env:VCPKG_ROOT"
           $exe  = Join-Path $root "vcpkg.exe"
           $gitd = Join-Path $root ".git"
 
           $needClone = $false
-
-          if (!(Test-Path $exe)) {
-            Write-Host "vcpkg.exe not found -> need clone"
-            $needClone = $true
-          } elseif (!(Test-Path $gitd)) {
-            Write-Host "vcpkg folder exists but is NOT a git repo (missing .git). Re-cloning..."
-            $needClone = $true
-          }
+          if (!(Test-Path $exe)) { $needClone = $true }
+          elseif (!(Test-Path $gitd)) { $needClone = $true }
 
           if ($needClone) {
-            if (Test-Path $root) {
-              Remove-Item -Recurse -Force $root
-            }
+            if (Test-Path $root) { Remove-Item -Recurse -Force $root }
             git clone --depth 1 https://github.com/microsoft/vcpkg $root
             & (Join-Path $root "bootstrap-vcpkg.bat")
           }
 
-          # sanity: print version
           & $exe version
 
+      # vcpkg manifest mode may require builtin-baseline; it is defined as a vcpkg commit SHA for default registry resolution. [2](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-eus-d6-fda41aaf49a3c7ec5922bb0dcffc8638/views/original)[1](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/advanced/advancedryz/windows/llm/llamacpp.html)
       - name: Create vcpkg manifest with builtin-baseline (OpenCL)
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
-          # vcpkg manifest mode may require builtin-baseline for default registry versioning. [1](https://eu-prod.asyncgw.teams.microsoft.com/v1/objects/0-eus-d6-fda41aaf49a3c7ec5922bb0dcffc8638/views/original)[2](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/advanced/advancedryz/windows/llm/llamacpp.html)
-          $baseline = (git -C "${env:VCPKG_ROOT}" rev-parse HEAD).Trim()
+          $baseline = (git -C "$env:VCPKG_ROOT" rev-parse HEAD).Trim()
           if (-not $baseline -or $baseline.Length -lt 40) { throw "Failed to compute vcpkg baseline SHA." }
 
           @"
@@ -120,35 +121,37 @@ jobs:
           }
           "@ | Out-File -Encoding utf8 vcpkg.json
 
-          Write-Host "Using vcpkg builtin-baseline: $baseline"
-
       - name: Install OpenCL (vcpkg manifest mode)
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
-          # Install dependencies declared in vcpkg.json in manifest mode. [2](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/advanced/advancedryz/windows/llm/llamacpp.html)[6](https://www.reddit.com/r/LocalLLaMA/comments/1c0gop8/why_is_llamacpp_no_longer_providing_binaries/)
-          & "${env:VCPKG_ROOT}\vcpkg.exe" install --triplet $env:VCPKG_TRIPLET
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet $env:VCPKG_TRIPLET
 
-      # ------------------------------------------------------------
-      # Build llama.cpp (OpenVINO backend)
-      # ------------------------------------------------------------
+      # -------------------------
+      # Build llama.cpp (OpenVINO)
+      # -------------------------
+      # OpenVINO backend Windows build uses setupvars + CMake/Ninja + vcpkg toolchain in the docs. [3](https://docs.openvino.ai/2025/openvino-workflow/deployment-locally.html)
       - name: Configure + Build llama-server (OpenVINO)
         shell: cmd
         run: |
           call C:\openvino\setupvars.bat
 
+          set "VCPKG_ROOT=C:\vcpkg"
+          set "VCPKG_TRIPLET=x64-windows"
+
           cmake -S . -B build\ReleaseOV -G Ninja ^
             -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
             -DGGML_OPENVINO=ON ^
             -DLLAMA_CURL=OFF ^
-            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-            -DVCPKG_TARGET_TRIPLET=%VCPKG_TRIPLET%
+            -DCMAKE_TOOLCHAIN_FILE="%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" ^
+            -DVCPKG_TARGET_TRIPLET=%VCPKG_TRIPLET% ^
+            -DCMAKE_MAKE_PROGRAM=ninja
 
           cmake --build build\ReleaseOV --config %BUILD_TYPE% --parallel
 
-      # ------------------------------------------------------------
-      # Package artifact (self-contained runtime)
-      # ------------------------------------------------------------
+      # -------------------------
+      # Package artifact
+      # -------------------------
       - name: Stage llama-server.exe
         shell: pwsh
         run: |
@@ -157,10 +160,10 @@ jobs:
           if (-not $exe) { throw "llama-server.exe not found" }
           Copy-Item $exe.FullName dist\llama-server.exe -Force
 
-      - name: Bundle OpenVINO runtime DLLs (so no OpenVINO install is required)
+      # Bundle OpenVINO runtime DLLs next to exe so it doesn't assume OpenVINO is installed. [6](https://zhuanlan.zhihu.com/p/718654291)[3](https://docs.openvino.ai/2025/openvino-workflow/deployment-locally.html)
+      - name: Bundle OpenVINO runtime DLLs
         shell: pwsh
         run: |
-          # This uses the OpenVINO archive distribution layout (download/extract). [5](https://zhuanlan.zhihu.com/p/718654291)[4](https://docs.openvino.ai/2025/openvino-workflow/deployment-locally.html)
           $ov = Get-ChildItem C:\openvino -Recurse -Filter openvino.dll -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $ov) { throw "openvino.dll not found" }
           $bin = $ov.Directory.FullName
@@ -168,7 +171,6 @@ jobs:
           Copy-Item "$bin\*.dll" dist\ -Force -ErrorAction SilentlyContinue
           Copy-Item "$bin\*.xml" dist\ -Force -ErrorAction SilentlyContinue
 
-          # Copy TBB dlls if present (common dependency)
           Get-ChildItem C:\openvino -Recurse -Filter "tbb*.dll" -ErrorAction SilentlyContinue |
             ForEach-Object { Copy-Item $_.FullName dist\ -Force -ErrorAction SilentlyContinue }
 
