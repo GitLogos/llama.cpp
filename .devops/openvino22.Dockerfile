@@ -7,7 +7,9 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /src
 
-# Install build tooling (OpenVINO image already contains OpenVINO runtime/dev components)
+# Ensure we're root for installs (some images default to non-root)
+USER root
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git \
       ca-certificates \
@@ -18,11 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy your repo contents (assumes this Dockerfile lives in your llama.cpp fork/repo)
 COPY . /src
 
-# Build llama.cpp with OpenVINO backend enabled and only build llama-server
-# GGML_OPENVINO enables the OpenVINO backend in llama.cpp. [2](https://docs.openvino.ai/2025/get-started/install-openvino/configurations/configurations-intel-gpu.html)
 RUN cmake -S . -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DGGML_OPENVINO=ON \
@@ -35,7 +34,10 @@ FROM openvino/ubuntu22_dev:latest AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Minimal runtime utils: curl for healthcheck, plus clean
+# Ensure we're root for apt
+USER root
+
+# Install curl for HEALTHCHECK
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
     && rm -rf /var/lib/apt/lists/*
