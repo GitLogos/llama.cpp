@@ -1,8 +1,9 @@
+
 name: Publish OpenVINO llama-server to GHCR
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     tags:
       - "v*"
   workflow_dispatch:
@@ -24,10 +25,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3 # Docker official GitHub Actions pattern [2](https://bing.com/search?q=llama.cpp+docker.yml+workflow+openvino+image+build+target)
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3 # Docker official GitHub Actions pattern [2](https://bing.com/search?q=llama.cpp+docker.yml+workflow+openvino+image+build+target)
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -35,7 +36,7 @@ jobs:
 
       - name: Extract Docker metadata (tags/labels)
         id: meta
-        uses: docker/metadata-action@v5 # Docker official GitHub Actions pattern [2](https://bing.com/search?q=llama.cpp+docker.yml+workflow+openvino+image+build+target)
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -53,13 +54,18 @@ jobs:
             type=sha,format=short,prefix=openvino-server-sha-
 
       - name: Build and push (server target)
-        uses: docker/build-push-action@v5 # Docker official GitHub Actions pattern [2](https://bing.com/search?q=llama.cpp+docker.yml+workflow+openvino+image+build+target)
+        uses: docker/build-push-action@v5
         with:
           context: .
           file: .devops/openvino.Dockerfile
-          target: server  # llama.cpp OpenVINO docs show building the "server" target [1](https://oneuptime.com/blog/post/2026-02-20-github-actions-docker-build-push/view)
+          target: server
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+          # Build cache (GitHub Actions cache)
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+          # Optional: turn off provenance to reduce GHCR artifact size/noise
+          provenance: false
