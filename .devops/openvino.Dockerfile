@@ -77,10 +77,19 @@ FROM ubuntu:${UBUNTU_VERSION} AS base
 ARG http_proxy
 ARG https_proxy
 
+# ✅ IMPORTANT: Install Intel GPU runtime stack in the FINAL runtime image
+# This is what makes /etc/OpenCL/vendors/*.icd appear and provides Level Zero loader/runtime
 RUN apt-get update \
-    && apt-get install -y libgomp1 libtbb12 curl\
-    && apt autoremove -y \
-    && apt clean -y \
+    && apt-get install -y --no-install-recommends \
+        libgomp1 \
+        libtbb12 \
+        curl \
+        ocl-icd-libopencl1 \
+        intel-opencl-icd \
+        intel-level-zero-gpu \
+        level-zero \
+    && apt-get autoremove -y \
+    && apt-get clean -y \
     && rm -rf /tmp/* /var/tmp/* \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
