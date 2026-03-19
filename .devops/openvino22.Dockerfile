@@ -18,9 +18,7 @@ RUN cmake -S . -B build -G Ninja \
       -DGGML_OPENVINO=ON \
     && cmake --build build --target llama-server -j"$(nproc)"
 
-RUN ldd /src/build/bin/llama-server || true
-
-# Fix: Safely find and gather all generated shared libraries into one directory
+# Gather all generated shared libraries into one directory for easy copying
 RUN mkdir -p /src/build-libs \
     && find /src/build/lib /src/build/bin -maxdepth 1 -name "*.so*" -exec cp {} /src/build-libs/ \; 2>/dev/null || true
 
@@ -34,19 +32,25 @@ ARG DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# FIX: Added libgomp1 (required for OpenMP multi-threading) 
+# and libatomic1 (common C++ dependency)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl \
+      libgomp1 \
+      libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy server binary
 COPY --from=build /src/build/bin/llama-server /app/llama-server
 
-# Fix: Perform a single, clean copy of the gathered libraries
+# Copy the gathered llama.cpp shared libs
 COPY --from=build /src/build-libs/ /app/lib/
 
 # Ensure the dynamic linker can find them
 RUN echo "/app/lib" > /etc/ld.so.conf.d/llama-local.conf && ldconfig
 
-RUN ldd /app/llama-server | sed -n '1,200p'
+# Verification: Show dependencies to catch missing ones early in logs
+RUN ldd /app/llama-server | sed -n '1,100p'
 
 ENV LLAMA_ARG_HOST=0.0.0.0
 EXPOSE 8080
